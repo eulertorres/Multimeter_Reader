@@ -2,66 +2,101 @@ import cv2
 import numpy as np
 import pyautogui
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import time
+from matplotlib.widgets import Slider, Button, CheckButtons
 from datetime import datetime
 import json
-from matplotlib.widgets import Slider, Button
+import time
 
 # ================= Configurações Iniciais =================
-# Parâmetros para offsets caso não se utilize posicionamento manual para os demais dígitos
-offset_d1 = 105
-offset_d2 = offset_d1 * 2
-offset_d3 = offset_d1 * 3
-offsety_d1 = 1
-offsety_d2 = offsety_d1 * 2
-offsety_d3 = offsety_d1 * 3
-
-# Parâmetros para captura da tela
+# Parâmetros para captura da tela (região onde o display aparece)
 origem_x = 1429
 origem_y = 511
-zoom = 0.972
+zoom = 0.972  # fator de escala
 
-# Thresholds para identificação (ajuste conforme necessário)
+# Parâmetros para thresholds (pode ser ajustado via slider se necessário)
 threshold_template = {"0": 100, "1": 100, "2": 100, "3": 100}
-
-# Listas para armazenar os dígitos identificados e os tempos
-digitos_por_tempo = []
-tempos = []
 
 # Parâmetros de ajuste de imagem
 brilho = 0
 contraste = 1.0
 
-# Flag para controle da medição
-inicio = False
+# Listas para armazenar os dígitos identificados e os tempos
+digitos_por_tempo = []
+tempos = []
+
+# Flags de medição e tracking
+medicao_ativa = False
+tracking_ativo = False
+
+# ================= Variáveis de Tracking pelo Quadrado do Display =================
+# Variáveis para selecionar a região do display (bounding box)
+selecionando_borda = False
+tracking_bbox_points = []  # pontos clicados pelo usuário (4 pontos)
+tracking_bbox = None       # [x, y, w, h]
+tracking_template = None   # imagem (em gray) do display extraída da região definida
 
 # ================= Templates dos Dígitos =================
-# Cada template é uma lista de 7 pontos (ordem: a, b, c, d, e, f, g)
+# Cada template: lista de 7 pontos na ordem (a,b,c,d,e,f,g)
 template_d0 = []
 template_d1 = []
 template_d2 = []
 template_d3 = []
 
-# Flags para controle do posicionamento dos templates
-posicionando = {"0": False, "1": False, "2": False, "3": False}
+# ================= Variáveis para ignorar dígitos =================
+# dicionário para controle: se True, o dígito é ignorado (não lido)
+ignore_digits = {"0": False, "1": False, "2": False, "3": False}
 
-# Flag para ignorar dígitos: "nenhum", "d3" ou "d2_d3"
-ignorar = "nenhum"
+# ================= Funções de Configuração (Salvar/Carregar) =================
+CONFIG_FILE = 'configuracoes.json'
 
-# ================= Funções Auxiliares =================
 def salvar_configuracoes():
-    configuracoes = {'origem_x': origem_x, 'origem_y': origem_y, 'zoom': zoom}
-    with open('configuracoes.json', 'w') as arquivo:
+    """Salva os parâmetros de captura e os templates atuais no JSON."""
+    configuracoes = {
+        'origem_x': origem_x,
+        'origem_y': origem_y,
+        'zoom': zoom,
+        'template_d0': template_d0,
+        'template_d1': template_d1,
+        'template_d2': template_d2,
+        'template_d3': template_d3
+    }
+    with open(CONFIG_FILE, 'w') as arquivo:
         json.dump(configuracoes, arquivo)
+    print("Configurações salvas.")
 
 def carregar_configuracoes():
+    """Carrega os parâmetros e templates do arquivo JSON; se não existir, usa valores padrão."""
+    global origem_x, origem_y, zoom, template_d0, template_d1, template_d2, template_d3
     try:
-        with open('configuracoes.json', 'r') as arquivo:
-            return json.load(arquivo)
+        with open(CONFIG_FILE, 'r') as arquivo:
+            config = json.load(arquivo)
+            origem_x = config.get('origem_x', origem_x)
+            origem_y = config.get('origem_y', origem_y)
+            zoom = config.get('zoom', zoom)
+            template_d0[:] = config.get('template_d0', [])
+            template_d1[:] = config.get('template_d1', [])
+            template_d2[:] = config.get('template_d2', [])
+            template_d3[:] = config.get('template_d3', [])
+            print("Configurações carregadas.")
+            return config
     except (FileNotFoundError, json.JSONDecodeError):
-        return {'origem_x': 1257, 'origem_y': 500, 'zoom': 1.015}
+        print("Arquivo de configuração não encontrado. Usando valores padrão.")
+        return {}
 
+def restaurar_templates():
+    """Restaura os templates para os valores salvos no JSON."""
+    config = carregar_configuracoes()
+    global template_d0, template_d1, template_d2, template_d3
+    template_d0[:] = config.get('template_d0', [])
+    template_d1[:] = config.get('template_d1', [])
+    template_d2[:] = config.get('template_d2', [])
+    template_d3[:] = config.get('template_d3', [])
+    print("Templates restaurados para os valores salvos.")
+
+# Carrega configurações (se existirem)
+carregar_configuracoes()
+
+# ================= Funções Auxiliares =================
 def exportar_dados_para_txt(tempos, digitos_por_tempo, nome_arquivo="dados_digitos.txt"):
     with open(nome_arquivo, "w") as arquivo:
         for tempo, digito in zip(tempos, digitos_por_tempo):
@@ -74,8 +109,8 @@ def exportar_dados_para_txt(tempos, digitos_por_tempo, nome_arquivo="dados_digit
     print(f"Dados exportados para {nome_arquivo} com sucesso.")
 
 def ajustar_brilho_contraste(img, brilho=0, contraste=1.0):
-    nova_img = np.clip(contraste * img + brilho, 0, 255)
-    return nova_img.astype(np.uint8)
+    nova = np.clip(contraste * img + brilho, 0, 255)
+    return nova.astype(np.uint8)
 
 def tratar_imagem(img, brilho=0, contraste=1.0):
     img_ajustada = ajustar_brilho_contraste(img, brilho, contraste)
@@ -85,72 +120,99 @@ def tratar_imagem(img, brilho=0, contraste=1.0):
     return img_eq
 
 def calcular_luminosidade_ponto(img, ponto):
-    altura, largura = img.shape[:2]
+    h, w = img.shape[:2]
     x, y = int(ponto[0]), int(ponto[1])
-    if 0 <= x < largura and 0 <= y < altura:
-        if len(img.shape) == 3:
-            return np.mean(img[y, x])
-        else:
-            return img[y, x]
+    if 0 <= x < w and 0 <= y < h:
+        return np.mean(img[y, x]) if len(img.shape)==3 else img[y, x]
     return 0
 
 def identificar_digito(segmentos_str):
     mapa = {
-        '1111110': 0, '0110000': 1, '1101101': 2, '1111001': 3,
-        '0110011': 4, '1011011': 5, '1011111': 6, '1110000': 7,
-        '1111111': 8, '1111011': 9,
+        '1111110': 0, '0110000': 1, '1101101': 2,
+        '1111001': 3, '0110011': 4, '1011011': 5,
+        '1011111': 6, '1110000': 7, '1111111': 8,
+        '1111011': 9,
     }
     return mapa.get(segmentos_str, '?')
 
 def calcular_digito(img, template, threshold):
-    segmentos_ativos = []
+    ativos = []
     for ponto in template:
-        # Calcula o valor de cinza no ponto e compara com o threshold
         lum = calcular_luminosidade_ponto(img, ponto)
-        segmentos_ativos.append(lum < threshold)
-    return ''.join(['1' if seg else '0' for seg in segmentos_ativos])
+        ativos.append(lum < threshold)
+    return ''.join(['1' if a else '0' for a in ativos])
 
-# ================= Interface Unificada =================
-# Cria uma figura unificada usando GridSpec para dividir a área de preview e os controles
-fig = plt.figure(figsize=(12, 8))
-gs = gridspec.GridSpec(2, 1, height_ratios=[4, 1])
-ax_preview = fig.add_subplot(gs[0])
-ax_preview.set_title("Preview e Medição")
-# Área dos controles abaixo será definida por botões e sliders usando fig.add_axes()
+def desenhar_template(ax, template, cor='r', thresh=100, img_gray=None):
+    if template:
+        xs, ys = zip(*template)
+        ax.plot(xs, ys, color=cor, marker='o', linestyle='-', markersize=6)
+        if img_gray is not None:
+            for (x, y) in template:
+                val = calcular_luminosidade_ponto(img_gray, (x, y))
+                ax.text(x, y, f"{val:.0f}", color=cor, fontsize=8, alpha=0.7)
 
-# Sliders e botões serão posicionados na parte inferior
-# Exemplo de posicionamento:
-slider_origem_x_ax = fig.add_axes([0.05, 0.15, 0.2, 0.04])
-slider_origem_y_ax = fig.add_axes([0.05, 0.10, 0.2, 0.04])
-slider_zoom_ax      = fig.add_axes([0.05, 0.05, 0.2, 0.04])
-slider_brilho_ax    = fig.add_axes([0.30, 0.15, 0.2, 0.04])
-slider_contraste_ax = fig.add_axes([0.30, 0.10, 0.2, 0.04])
+# ================= Interface Unificada (Preview + Controles) =================
+# Cria uma janela menor (por exemplo, 8x6 polegadas)
+fig = plt.figure(figsize=(8,6))
 
-button_start_ax     = fig.add_axes([0.60, 0.10, 0.15, 0.08])
-button_ignore_ax    = fig.add_axes([0.77, 0.10, 0.20, 0.08])
+# Área de preview (parte superior)
+ax_preview = fig.add_axes([0.05, 0.35, 0.9, 0.6])
+ax_preview.set_title("Preview da Captura")
 
-# Botões para posicionar templates dos dígitos (0 a 3)
-button_template0_ax = fig.add_axes([0.60, 0.01, 0.1, 0.06])
-button_template1_ax = fig.add_axes([0.71, 0.01, 0.1, 0.06])
-button_template2_ax = fig.add_axes([0.82, 0.01, 0.1, 0.06])
-button_template3_ax = fig.add_axes([0.93, 0.01, 0.1, 0.06])
+# Sliders (na parte inferior esquerda)
+ax_slider_zoom      = fig.add_axes([0.05, 0.28, 0.3, 0.03])
+ax_slider_origem_x  = fig.add_axes([0.05, 0.24, 0.3, 0.03])
+ax_slider_origem_y  = fig.add_axes([0.05, 0.20, 0.3, 0.03])
+ax_slider_brilho    = fig.add_axes([0.05, 0.16, 0.3, 0.03])
+ax_slider_contraste = fig.add_axes([0.05, 0.12, 0.3, 0.03])
 
-# Criação dos sliders
-slider_origem_x = Slider(slider_origem_x_ax, 'Origem X', 950, 1920, valinit=origem_x)
-slider_origem_y = Slider(slider_origem_y_ax, 'Origem Y', 0, 900, valinit=origem_y)
-slider_zoom = Slider(slider_zoom_ax, 'Zoom', 0.5, 4.0, valinit=zoom)
-slider_brilho = Slider(slider_brilho_ax, 'Brilho', -100, 100, valinit=brilho)
-slider_contraste = Slider(slider_contraste_ax, 'Contraste', 0.5, 3.0, valinit=contraste)
+slider_zoom      = Slider(ax_slider_zoom, 'Zoom', 0.5, 4.0, valinit=zoom)
+slider_origem_x  = Slider(ax_slider_origem_x, 'Origem X', 950, 1920, valinit=origem_x)
+slider_origem_y  = Slider(ax_slider_origem_y, 'Origem Y', 0, 900, valinit=origem_y)
+slider_brilho    = Slider(ax_slider_brilho, 'Brilho', -100, 100, valinit=brilho)
+slider_contraste = Slider(ax_slider_contraste, 'Contraste', 0.5, 3.0, valinit=contraste)
 
-# Criação dos botões
-button_start = Button(button_start_ax, 'Iniciar')
-button_ignore = Button(button_ignore_ax, 'Ignorar: Nenhum')
-button_template0 = Button(button_template0_ax, 'Dígito 0')
-button_template1 = Button(button_template1_ax, 'Dígito 1')
-button_template2 = Button(button_template2_ax, 'Dígito 2')
-button_template3 = Button(button_template3_ax, 'Dígito 3')
+# Botões de ação (parte inferior central e direita)
+ax_bt_start     = fig.add_axes([0.4, 0.20, 0.15, 0.06])
+button_start    = Button(ax_bt_start, 'Iniciar/Parar')
 
-def update_sliders(val):
+ax_bt_tracking  = fig.add_axes([0.4, 0.12, 0.15, 0.06])
+button_tracking = Button(ax_bt_tracking, 'Tracking: Off')
+
+ax_bt_borda = fig.add_axes([0.4, 0.04, 0.15, 0.06])
+button_borda = Button(ax_bt_borda, 'Selecionar Borda')
+
+# Botões para posicionar os templates dos dígitos (lado direito)
+ax_bt_d0 = fig.add_axes([0.6, 0.20, 0.12, 0.06])
+ax_bt_d1 = fig.add_axes([0.73, 0.20, 0.12, 0.06])
+ax_bt_d2 = fig.add_axes([0.6, 0.12, 0.12, 0.06])
+ax_bt_d3 = fig.add_axes([0.73, 0.12, 0.12, 0.06])
+button_d0 = Button(ax_bt_d0, 'Posicionar D0')
+button_d1 = Button(ax_bt_d1, 'Posicionar D1')
+button_d2 = Button(ax_bt_d2, 'Posicionar D2')
+button_d3 = Button(ax_bt_d3, 'Posicionar D3')
+
+# Caixa de seleção para ignorar dígitos (lado direito inferior)
+ax_ignore = fig.add_axes([0.6, 0.04, 0.25, 0.12])
+check_labels = ["Ignorar D0", "Ignorar D1", "Ignorar D2", "Ignorar D3"]
+check_status = [ignore_digits["0"], ignore_digits["1"], ignore_digits["2"], ignore_digits["3"]]
+check_ignore = CheckButtons(ax_ignore, check_labels, check_status)
+
+def ignore_callback(label):
+    # Atualiza o dicionário global ignore_digits conforme a caixa marcada/desmarcada
+    if label == "Ignorar D0":
+        ignore_digits["0"] = not ignore_digits["0"]
+    elif label == "Ignorar D1":
+        ignore_digits["1"] = not ignore_digits["1"]
+    elif label == "Ignorar D2":
+        ignore_digits["2"] = not ignore_digits["2"]
+    elif label == "Ignorar D3":
+        ignore_digits["3"] = not ignore_digits["3"]
+    print("Ignore digits:", ignore_digits)
+check_ignore.on_clicked(ignore_callback)
+
+# ================= Atualização dos Parâmetros via Sliders =================
+def update_params(val):
     global origem_x, origem_y, zoom, brilho, contraste
     origem_x = int(slider_origem_x.val)
     origem_y = int(slider_origem_y.val)
@@ -158,52 +220,74 @@ def update_sliders(val):
     brilho = slider_brilho.val
     contraste = slider_contraste.val
     salvar_configuracoes()
+slider_zoom.on_changed(update_params)
+slider_origem_x.on_changed(update_params)
+slider_origem_y.on_changed(update_params)
+slider_brilho.on_changed(update_params)
+slider_contraste.on_changed(update_params)
 
-slider_origem_x.on_changed(update_sliders)
-slider_origem_y.on_changed(update_sliders)
-slider_zoom.on_changed(update_sliders)
-slider_brilho.on_changed(update_sliders)
-slider_contraste.on_changed(update_sliders)
+# ================= Função de Captura =================
+def capturar():
+    largura = int(430 / zoom)
+    altura  = int(300 / zoom)
+    img = np.array(pyautogui.screenshot(region=(origem_x, origem_y, largura, altura)))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
 
-def toggle_medicao(event):
-    global inicio, time_zero
-    inicio = not inicio
-    if inicio:
-        button_start.label.set_text("Parar")
-        print("Medição iniciada.")
-        time_zero = datetime.now()
+# ================= Função de Identificação e Exibição =================
+def identificar_e_exibir(current_time, frame_processado, frame_gray):
+    # Para cada dígito, se não estiver ignorado, lê-o; caso contrário, exibe "-" como placeholder
+    resultado = []
+    # Dígito 0
+    if ignore_digits["0"]:
+        resultado.append("-")
     else:
-        button_start.label.set_text("Iniciar")
-        exportar_dados_para_txt(tempos, digitos_por_tempo)
-        # Exibe o gráfico dos resultados
-        plt.figure()
-        plt.plot([t.total_seconds() for t in tempos], digitos_por_tempo, 'bo-')
-        plt.xlabel('Tempo (s)')
-        plt.ylabel('Dígito')
-        plt.title('Medição dos dígitos')
-        plt.show()
-        print("Medição parada.")
-button_start.on_clicked(toggle_medicao)
-
-def alternar_ignorar(event):
-    global ignorar
-    if ignorar == "nenhum":
-        ignorar = "d3"
-        button_ignore.label.set_text("Ignorar: Dígito 3")
-    elif ignorar == "d3":
-        ignorar = "d2_d3"
-        button_ignore.label.set_text("Ignorar: Dígitos 2 e 3")
+        if len(template_d0) == 7:
+            seg = calcular_digito(frame_processado, template_d0, threshold_template["0"])
+            resultado.append(str(identificar_digito(seg)))
+        else:
+            resultado.append("?")
+    # Dígito 1
+    if ignore_digits["1"]:
+        resultado.append("-")
     else:
-        ignorar = "nenhum"
-        button_ignore.label.set_text("Ignorar: Nenhum")
-    print("Opção de ignorar:", ignorar)
-button_ignore.on_clicked(alternar_ignorar)
+        if len(template_d1) == 7:
+            seg = calcular_digito(frame_processado, template_d1, threshold_template["1"])
+            resultado.append(str(identificar_digito(seg)))
+        else:
+            resultado.append("?")
+    # Dígito 2
+    if ignore_digits["2"]:
+        resultado.append("-")
+    else:
+        if len(template_d2) == 7:
+            seg = calcular_digito(frame_processado, template_d2, threshold_template["2"])
+            resultado.append(str(identificar_digito(seg)))
+        else:
+            resultado.append("?")
+    # Dígito 3
+    if ignore_digits["3"]:
+        resultado.append("-")
+    else:
+        if len(template_d3) == 7:
+            seg = calcular_digito(frame_processado, template_d3, threshold_template["3"])
+            resultado.append(str(identificar_digito(seg)))
+        else:
+            resultado.append("?")
+    ax_preview.set_title("Dígitos: " + " ".join(resultado))
+    # Se nenhum dígito lido for "?" (erro), então concatena os dígitos não ignorados e registra
+    if "?" not in resultado:
+        # Concatena somente os dígitos que não são ignorados (ignorados serão pulados)
+        numero = "".join([d for d in resultado if d != "-"])
+        if numero != "":
+            digitos_por_tempo.append(int(numero))
+            tempos.append(current_time)
 
+# ================= Modo de Posicionamento dos Templates =================
 def ativar_template(digito):
     def func(event):
-        global template_d0, template_d1, template_d2, template_d3
+        global posicionando
         posicionando[str(digito)] = True
-        # Reinicia o template para o dígito selecionado
         if digito == 0:
             template_d0.clear()
         elif digito == 1:
@@ -212,142 +296,170 @@ def ativar_template(digito):
             template_d2.clear()
         elif digito == 3:
             template_d3.clear()
-        print(f"Posicionando dígito {digito}: Clique nos 7 pontos na ordem (a,b,c,d,e,f,g).")
+        print(f"Posicionando dígito {digito}: clique nos 7 pontos (ordem a, b, c, d, e, f, g).")
     return func
+button_d0.on_clicked(ativar_template(0))
+button_d1.on_clicked(ativar_template(1))
+button_d2.on_clicked(ativar_template(2))
+button_d3.on_clicked(ativar_template(3))
 
-button_template0.on_clicked(ativar_template(0))
-button_template1.on_clicked(ativar_template(1))
-button_template2.on_clicked(ativar_template(2))
-button_template3.on_clicked(ativar_template(3))
+# ================= Botão para Selecionar Borda do Display (para tracking) =================
+def selecionar_borda(event):
+    global selecionando_borda, tracking_bbox_points, tracking_bbox, tracking_template
+    selecionando_borda = True
+    tracking_bbox_points = []
+    print("Selecione 4 pontos que definem as bordas do display (em ordem arbitrária).")
+button_borda.on_clicked(selecionar_borda)
 
-# Função para capturar cliques na área de preview e registrar pontos para o template em posicionamento
+# ================= Toggle de Tracking Automático =================
+def toggle_tracking(event):
+    global tracking_ativo, tracking_template, tracking_bbox
+    tracking_ativo = not tracking_ativo
+    if tracking_ativo:
+        button_tracking.label.set_text("Tracking: On")
+        frame = capturar()
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        if tracking_bbox is not None:
+            x, y, w, h = tracking_bbox
+            tracking_template = frame_gray[y:y+h, x:x+w].copy()
+        else:
+            # Se a região de tracking não foi definida, usa o centro do frame
+            h, w = frame_gray.shape
+            tracking_bbox = (w//4, h//4, w//2, h//2)
+            tracking_template = frame_gray[tracking_bbox[1]:tracking_bbox[1]+tracking_bbox[3],
+                                            tracking_bbox[0]:tracking_bbox[0]+tracking_bbox[2]].copy()
+        print("Tracking ativado.")
+    else:
+        button_tracking.label.set_text("Tracking: Off")
+        tracking_template = None
+        print("Tracking desativado.")
+button_tracking.on_clicked(toggle_tracking)
+
+# ================= Captura de Cliques na Área de Preview =================
 def on_click(event):
+    global selecionando_borda, tracking_bbox_points
     if event.inaxes != ax_preview:
         return
-    for dig in posicionando:
-        if posicionando[dig]:
-            ponto = (event.xdata, event.ydata)
-            if dig == "0":
-                template_d0.append(ponto)
-                ax_preview.plot(event.xdata, event.ydata, 'ro', markersize=8)
-                print(f"Dígito 0 - Ponto {len(template_d0)}: ({event.xdata:.1f}, {event.ydata:.1f})")
-                if len(template_d0) == 7:
-                    posicionando["0"] = False
-                    print("Template completo para dígito 0.")
-            elif dig == "1":
-                template_d1.append(ponto)
-                ax_preview.plot(event.xdata, event.ydata, 'go', markersize=8)
-                print(f"Dígito 1 - Ponto {len(template_d1)}: ({event.xdata:.1f}, {event.ydata:.1f})")
-                if len(template_d1) == 7:
-                    posicionando["1"] = False
-                    print("Template completo para dígito 1.")
-            elif dig == "2":
-                template_d2.append(ponto)
-                ax_preview.plot(event.xdata, event.ydata, 'bo', markersize=8)
-                print(f"Dígito 2 - Ponto {len(template_d2)}: ({event.xdata:.1f}, {event.ydata:.1f})")
-                if len(template_d2) == 7:
-                    posicionando["2"] = False
-                    print("Template completo para dígito 2.")
-            elif dig == "3":
-                template_d3.append(ponto)
-                ax_preview.plot(event.xdata, event.ydata, 'co', markersize=8)
-                print(f"Dígito 3 - Ponto {len(template_d3)}: ({event.xdata:.1f}, {event.ydata:.1f})")
-                if len(template_d3) == 7:
-                    posicionando["3"] = False
-                    print("Template completo para dígito 3.")
-            fig.canvas.draw()
-            break
-
+    pt = (event.xdata, event.ydata)
+    # Se estiver selecionando a região de borda para tracking:
+    if selecionando_borda:
+        tracking_bbox_points.append(pt)
+        ax_preview.plot(pt[0], pt[1], 'mo', markersize=8)
+        fig.canvas.draw()
+        print(f"Ponto para borda: ({pt[0]:.1f}, {pt[1]:.1f})")
+        if len(tracking_bbox_points) == 4:
+            # Calcula a bounding box: mínimo x, mínimo y, largura e altura
+            xs = [p[0] for p in tracking_bbox_points]
+            ys = [p[1] for p in tracking_bbox_points]
+            x_min, y_min = min(xs), min(ys)
+            x_max, y_max = max(xs), max(ys)
+            tracking_bbox = (int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min))
+            selecionando_borda = False
+            print("Região de tracking definida:", tracking_bbox)
+    else:
+        # Se não estiver selecionando a borda, verifica se algum template está em modo de posicionamento
+        for dig in posicionando:
+            if posicionando[dig]:
+                if dig == "0":
+                    template_d0.append(pt)
+                    ax_preview.plot(pt[0], pt[1], 'ro', markersize=6)
+                    print(f"D0 - Ponto {len(template_d0)}: ({pt[0]:.1f}, {pt[1]:.1f})")
+                    if len(template_d0) == 7:
+                        posicionando["0"] = False
+                        print("Template completo para D0.")
+                        salvar_configuracoes()
+                elif dig == "1":
+                    template_d1.append(pt)
+                    ax_preview.plot(pt[0], pt[1], 'go', markersize=6)
+                    print(f"D1 - Ponto {len(template_d1)}: ({pt[0]:.1f}, {pt[1]:.1f})")
+                    if len(template_d1) == 7:
+                        posicionando["1"] = False
+                        print("Template completo para D1.")
+                        salvar_configuracoes()
+                elif dig == "2":
+                    template_d2.append(pt)
+                    ax_preview.plot(pt[0], pt[1], 'bo', markersize=6)
+                    print(f"D2 - Ponto {len(template_d2)}: ({pt[0]:.1f}, {pt[1]:.1f})")
+                    if len(template_d2) == 7:
+                        posicionando["2"] = False
+                        print("Template completo para D2.")
+                        salvar_configuracoes()
+                elif dig == "3":
+                    template_d3.append(pt)
+                    ax_preview.plot(pt[0], pt[1], 'co', markersize=6)
+                    print(f"D3 - Ponto {len(template_d3)}: ({pt[0]:.1f}, {pt[1]:.1f})")
+                    if len(template_d3) == 7:
+                        posicionando["3"] = False
+                        print("Template completo para D3.")
+                        salvar_configuracoes()
+                fig.canvas.draw()
+                break
 fig.canvas.mpl_connect('button_press_event', on_click)
 
-# ================= Função de Captura e Processamento =================
-def capturar():
-    global origem_x, origem_y, zoom, brilho, contraste
-    largura = int(430 / zoom)
-    altura = int(300 / zoom)
-    img = np.array(pyautogui.screenshot(region=(origem_x, origem_y, largura, altura)))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    if inicio:
-        return tratar_imagem(img, brilho, contraste)
-    return img
+# ================= Botão Iniciar/Parar =================
+time_zero = None
+def iniciar_parar(event):
+    global medicao_ativa, time_zero, digitos_por_tempo, tempos
+    medicao_ativa = not medicao_ativa
+    if medicao_ativa:
+        time_zero = datetime.now()
+        digitos_por_tempo.clear()
+        tempos.clear()
+        button_start.label.set_text("Parar")
+        print("Medição iniciada.")
+    else:
+        exportar_dados_para_txt(tempos, digitos_por_tempo)
+        print("Dados salvos em dados_digitos.txt")
+        # Exibe o gráfico dos dígitos medidos
+        plt.figure()
+        plt.plot([t.total_seconds() for t in tempos], digitos_por_tempo, 'bo-')
+        plt.xlabel('Tempo (s)')
+        plt.ylabel('Número lido (concatenação dos dígitos não ignorados)')
+        plt.title('Medição dos dígitos')
+        plt.show()
+        restaurar_templates()
+        button_start.label.set_text("Iniciar/Parar")
+        print("Templates restaurados para os valores originais.")
+button_start.on_clicked(iniciar_parar)
 
-def identificar(img, current_time):
-    global template_d0, template_d1, template_d2, template_d3, ignorar
-    digitos_identificados = []
-    # Dígito 0
-    if template_d0 and len(template_d0) == 7:
-        seg0 = calcular_digito(img, template_d0, threshold_template["0"])
-        dig0 = identificar_digito(seg0)
-    else:
-        dig0 = '?'
-    digitos_identificados.append(dig0)
-    
-    # Dígito 1
-    if template_d1 and len(template_d1) == 7:
-        seg1 = calcular_digito(img, template_d1, threshold_template["1"])
-        dig1 = identificar_digito(seg1)
-    else:
-        dig1 = '?'
-    digitos_identificados.append(dig1)
-    
-    # Dígito 2 (verifica opção de ignorar)
-    if ignorar == "d2_d3":
-        digitos_identificados.append('?')
-    else:
-        if template_d2 and len(template_d2) == 7:
-            seg2 = calcular_digito(img, template_d2, threshold_template["2"])
-            dig2 = identificar_digito(seg2)
-        else:
-            dig2 = '?'
-        digitos_identificados.append(dig2)
-    
-    # Dígito 3 (verifica opção de ignorar)
-    if ignorar in ["d3", "d2_d3"]:
-        digitos_identificados.append('?')
-    else:
-        if template_d3 and len(template_d3) == 7:
-            seg3 = calcular_digito(img, template_d3, threshold_template["3"])
-            dig3 = identificar_digito(seg3)
-        else:
-            dig3 = '?'
-        digitos_identificados.append(dig3)
-    
-    # Armazena os dígitos se nenhum estiver com erro
-    if '?' not in digitos_identificados:
-        digitos_juntos = int(''.join(map(str, digitos_identificados)))
-        digitos_por_tempo.append(digitos_juntos)
-        tempos.append(current_time)
-    else:
-        digitos_por_tempo.append(0)
-        tempos.append(current_time)
-    
-    ax_preview.set_title("Dígitos: " + " ".join(map(str, digitos_identificados)))
-
-# ================= Loop Principal de Atualização =================
-# Atualização contínua da área de preview
+# ================= Loop Principal =================
 while True:
-    img = capturar()
-    ax_preview.clear()
-    ax_preview.imshow(img, cmap='gray')
+    frame = capturar()
+    frame_processado = tratar_imagem(frame, brilho, contraste)
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
     
-    # Desenha os templates (se definidos) com os valores de cinza próximos a cada ponto
-    def desenhar_template(template, cor):
-        if template and len(template) > 0:
-            xs, ys = zip(*template)
-            ax_preview.plot(xs, ys, marker='o', linestyle='-', color=cor, markersize=8)
-            # Mostra o valor de cinza de cada ponto (em fonte pequena)
-            for (x, y) in template:
-                val = calcular_luminosidade_ponto(img, (x, y))
-                ax_preview.text(x, y, f"{val:.0f}", color=cor, fontsize=7, ha='left', va='bottom', alpha=0.7)
-    desenhar_template(template_d0, 'r')
-    desenhar_template(template_d1, 'g')
-    desenhar_template(template_d2, 'b')
-    desenhar_template(template_d3, 'c')
+    # Se o tracking estiver ativo e a região de bounding box foi definida, usa template matching
+    if tracking_ativo and tracking_bbox is not None and tracking_template is not None:
+        # Procura a melhor correspondência da região template na imagem atual
+        res = cv2.matchTemplate(frame_gray, tracking_template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        # Calcula deslocamento (dx, dy) entre a posição atual da bbox e a nova posição
+        x_old, y_old, w, h = tracking_bbox
+        dx = max_loc[0] - x_old
+        dy = max_loc[1] - y_old
+        # Atualiza a bounding box e o template
+        tracking_bbox = (max_loc[0], max_loc[1], w, h)
+        tracking_template = frame_gray[max_loc[1]:max_loc[1]+h, max_loc[0]:max_loc[0]+w].copy()
+        # Atualiza todos os templates (dígitos) somando o deslocamento detectado
+        def atualizar_template(template):
+            return [(p[0] + dx, p[1] + dy) for p in template]
+        if template_d0: template_d0 = atualizar_template(template_d0)
+        if template_d1: template_d1 = atualizar_template(template_d1)
+        if template_d2: template_d2 = atualizar_template(template_d2)
+        if template_d3: template_d3 = atualizar_template(template_d3)
     
-    # Se estiver medindo, processa e identifica os dígitos
-    if inicio:
+    ax_preview.cla()
+    ax_preview.imshow(frame_processado, cmap='gray')
+    
+    # Desenha os templates com seus valores de cinza (de forma sutil)
+    desenhar_template(ax_preview, template_d0, cor='r', thresh=threshold_template["0"], img_gray=frame_processado)
+    desenhar_template(ax_preview, template_d1, cor='g', thresh=threshold_template["1"], img_gray=frame_processado)
+    desenhar_template(ax_preview, template_d2, cor='b', thresh=threshold_template["2"], img_gray=frame_processado)
+    desenhar_template(ax_preview, template_d3, cor='c', thresh=threshold_template["3"], img_gray=frame_processado)
+    
+    if medicao_ativa:
         current_time = datetime.now() - time_zero
-        identificar(img, current_time)
+        identificar_e_exibir(current_time, frame_processado, frame_gray)
     
     fig.canvas.draw_idle()
-    plt.pause(0.02)
+    plt.pause(0.03)  # aproximadamente 30 FPS
